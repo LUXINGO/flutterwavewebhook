@@ -3,22 +3,65 @@ const axios = require("axios");
 const admin = require("firebase-admin");
 
 const app = express();
+
+/* =========================
+   MIDDLEWARE (IMPORTANT)
+========================= */
+
+// Flutterwave may send JSON or form data
 app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+
+/* =========================
+   FIREBASE SETUP
+========================= */
+
+const serviceAccount = JSON.parse(process.env.FIREBASE_KEY);
 
 admin.initializeApp({
-  credential: admin.credential.cert(JSON.parse(process.env.FIREBASE_KEY))
+  credential: admin.credential.cert(serviceAccount)
 });
 
 const db = admin.firestore();
 
+/* =========================
+   TEST ROUTE
+========================= */
+
+app.get("/", (req, res) => {
+  res.send("🚀 Flutterwave Webhook Server is Live");
+});
+
+/* =========================
+   WEBHOOK ROUTE
+========================= */
+
 app.post("/webhook/flutterwave", async (req, res) => {
   try {
+    console.log("🔥 WEBHOOK RECEIVED");
+    console.log("BODY:", req.body);
+
     const event = req.body;
 
-    if (event.status !== "successful") return res.sendStatus(200);
+    // Flutterwave sends different formats sometimes
+    const status = event?.status || event?.data?.status;
 
-    const txRef = event.tx_ref;
-    const transactionId = event.id;
+    if (status !== "successful") {
+      console.log("❌ Payment not successful");
+      return res.sendStatus(200);
+    }
+
+    const transactionId = event?.id || event?.data?.id;
+    const txRef = event?.tx_ref || event?.data?.tx_ref;
+
+    if (!transactionId || !txRef) {
+      console.log("❌ Missing transaction data");
+      return res.sendStatus(200);
+    }
+
+    /* =========================
+       VERIFY PAYMENT (CRITICAL)
+    ========================= */
 
     const verify = await axios.get(
       `https://api.flutterwave.com/v3/transactions/${transactionId}/verify`,
@@ -29,20 +72,47 @@ app.post("/webhook/flutterwave", async (req, res) => {
       }
     );
 
-    if (verify.data.data.status === "successful") {
+    const data = verify.data.data;
+
+    console.log("✅ VERIFIED:", data.status);
+
+    if (data.status === "successful") {
+
+      /* =========================
+         UPDATE FIREBASE
+      ========================= */
+
       await db.collection("verificationRequests")
         .doc(txRef)
-        .update({
-          status: "approved",
-          verified: true
-        });
+        .set(
+          {
+            status: "approved",
+            verified: true,
+            plan: data.meta?.plan || "pro",
+            amount: data.amount,
+            currency: data.currency,
+            updatedAt: new Date()
+          },
+          { merge: true }
+        );
+
+      console.log("🔥 FIREBASE UPDATED");
     }
 
     res.sendStatus(200);
-  } catch (e) {
-    console.log(e);
+
+  } catch (error) {
+    console.log("❌ WEBHOOK ERROR:", error.message);
     res.sendStatus(500);
   }
 });
 
-app.listen(process.env.PORT || 3000);
+/* =========================
+   START SERVER
+========================= */
+
+const PORT = process.env.PORT || 3000;
+
+app.listen(PORT, () => {
+  console.log(`🚀 Server running on port ${PORT}`);
+});
